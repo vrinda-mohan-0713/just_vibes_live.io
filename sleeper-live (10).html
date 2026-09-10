@@ -1375,8 +1375,7 @@ button{
     },
     // Hard weekly cutoff (Weekly Start/Sit Grade only): these statuses count as 0 for the
     // CURRENT week's grade, no matter how the smooth season-long curve above would treat them.
-    WEEKLY_HARD_OUT_STATUSES: ['Out', 'Doubtful'],
-
+CONFIG.WEEKLY_HARD_OUT_STATUSES = ['Out', 'IR', 'PUP', 'Sus'];
     // ---- Weekly Start/Sit Grade (matchup-specific) ----
     ESPN_CACHE_TTL_MS: 10 * 60 * 1000, // don't hit ESPN odds/scoreboard more than once per 10 min
     ODDS_OU_THRESHOLD: 48,      // game total above which the environment counts as "high-scoring"
@@ -2753,9 +2752,11 @@ button{
   // who plainly isn't playing this week), falling through to the smooth season-long curve
   // above for everything else (Questionable, or long-term tags which are already ~0 there).
   function weeklyAvailability(p){
-    if(p && CONFIG.WEEKLY_HARD_OUT_STATUSES.includes(p.injury_status)) return 0;
-    return availabilityIndex(p);
-  }
+  if(!p || !p.injury_status) return 1.0;
+  if(CONFIG.WEEKLY_HARD_OUT_STATUSES.includes(p.injury_status)) return 0.0;
+  if(p.injury_status === 'Doubtful') return 0.50; // Partial projection for Doubtful vs. hard 0
+  return availabilityIndex(p);
+}
 
   // Fallback "points-scale" estimate from Sleeper's consensus search_rank, used as the
   // Bayesian/EWMA prior (FP_prior) for players with little or no real data yet.
@@ -2825,36 +2826,24 @@ button{
   }
 
   // 1. Realistic Waiver Replacement Baselines (PPG)
-const STATICAL_WAIVER_BASELINES = {
-  QB: 12.0,
-  RB: 7.5,
-  WR: 7.0,
-  TE: 4.5,
-  K: 6.0,
-  DEF: 5.0,
-  FLEX: 7.0
+onst STATISTICAL_WAIVER_BASELINES = {
+  QB: 12.0, RB: 7.5, WR: 7.0, TE: 4.5, K: 6.0, DEF: 5.0, FLEX: 7.0
 };
 
-// 2. Fixed Replacement Baseline Calculation
 function computeReplacementBaselines(hist, pointsFn){
   const fn = pointsFn || estimatedSeasonalPoints;
   const rostered = new Set();
-  
-  // Build set of all rostered player IDs
   (state.rosters || []).forEach(r => (r.players || []).forEach(pid => rostered.add(pid)));
   
-  const baselines = { ...STATICAL_WAIVER_BASELINES };
+  const baselines = { ...STATISTICAL_WAIVER_BASELINES };
 
   Object.keys(state.players || {}).forEach(pid => {
-    if (rostered.has(pid)) return; // Skip players already on fantasy rosters!
-    
+    if (rostered.has(pid)) return; // Exclude rostered players
     const p = state.players[pid];
     if(!p || !ANALYSIS_POSITIONS.includes(p.position) || !p.team) return;
 
     const fp = fn(pid, p, hist);
-    
-    // Cap replacement baseline to realistic waiver ranges (prevents free agent outliers)
-    const cap = STATICAL_WAIVER_BASELINES[p.position] + 3.5;
+    const cap = STATISTICAL_WAIVER_BASELINES[p.position] + 2.5; // Cap waiver baseline
     if(fp > baselines[p.position] && fp <= cap){
       baselines[p.position] = fp;
     }
@@ -2920,17 +2909,17 @@ function vorpFor(x, hist, baselines, posWeights, pointsFn){
 // 4. Adjusted Z-Score Grade Scale (Centers Average Team at B / B+)
 const GRADE_SCALE = [
   { min: 1.20, label:'A+' }, 
-  { min: 0.80, label:'A' }, 
-  { min: 0.40, label:'A-' },
-  { min: 0.10, label:'B+' }, 
-  { min:-0.20, label:'B' }, 
+  { min: 0.85, label:'A' }, 
+  { min: 0.50, label:'A-' },
+  { min: 0.20, label:'B+' }, 
+  { min:-0.15, label:'B' }, 
   { min:-0.50, label:'B-' },
-  { min:-0.80, label:'C+' }, 
-  { min:-1.10, label:'C' }, 
-  { min:-1.40, label:'C-' },
-  { min:-1.70, label:'D' }, 
+  { min:-0.85, label:'C+' }, 
+  { min:-1.20, label:'C' }, 
+  { min:-1.55, label:'C-' },
+  { min:-1.90, label:'D' }, 
   { min:-Infinity, label:'F' }
-];
+]
   // Formula 3.1: S_roster — rank each team's players within their real position (starters
   // + bench together), apply alpha^(k-1) so RB1 counts fully and RB5 tapers off.
   function rosterVorpScore(t, hist, baselines, posWeights, pointsFn){
@@ -3538,7 +3527,7 @@ teams.forEach(t=>{
   // older version of this dashboard (shared league-wide in window.storage) gets discarded
   // and recomputed instead of silently rendering without the newer fields — e.g. the debug
   // breakdown depends on a `debug` object per team that older cached snapshots don't have.
-  const ANALYSIS_SCHEMA_VERSION = 2;
+  const ANALYSIS_SCHEMA_VERSION = 3;
 
   async function ensureAnalysisFresh(force){
     if(!state.leagueId || !state.matchups || !state.matchups.length) return;

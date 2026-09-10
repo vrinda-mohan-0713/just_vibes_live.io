@@ -1356,8 +1356,8 @@ button{
     // ---- Season Roster Grade (holistic) ----
     VORP_ALPHA: 0.92,          // bench depth decay per rank within a position
     VORP_SHRINKAGE_M: 4.0,     // Bayesian credibility threshold (games) toward the rank-based prior
-    W_ROSTER: 0.60,            // composite weight: whole-roster VORP
-    W_STARTERS: 0.40,          // composite weight: this week's starting lineup
+    W_ROSTER: 0.80,            // composite weight: whole-roster VORP
+    W_STARTERS: 0.20,          // composite weight: this week's starting lineup
     RECENCY_LAMBDA: 0.80,      // EWMA decay for the week-over-week "form" trend signal
     TSI_WINEXP_BASE: 0.85,     // Pythagorean win-multiplier floor
     TSI_WINEXP_SPAN: 0.30,     // range added on top of the floor as Win%_exp -> 1
@@ -2760,11 +2760,29 @@ button{
   // Fallback "points-scale" estimate from Sleeper's consensus search_rank, used as the
   // Bayesian/EWMA prior (FP_prior) for players with little or no real data yet.
   function rankFallbackPoints(p){
-    if(!p) return 0;
-    const rank = p.search_rank;
-    if(!rank || rank <= 0 || rank > 9000) return 0.5;
-    return 600 / (rank + 20);
+  if(!p) return 0.5;
+  const rank = p.search_rank || 999;
+  const pos = p.position || 'WR';
+  
+  // Position-specific ADP/Rank PPG scaling
+  if(pos === 'QB'){
+    if(rank <= 30) return 20.0 - (rank * 0.25);
+    if(rank <= 100) return 12.0 - (rank * 0.05);
+    return 6.0;
   }
+  if(pos === 'RB' || pos === 'WR'){
+    if(rank <= 25) return 17.5 - (rank * 0.25);
+    if(rank <= 80) return 11.5 - (rank * 0.08);
+    if(rank <= 200) return 6.0 - (rank * 0.02);
+    return 2.0;
+  }
+  if(pos === 'TE'){
+    if(rank <= 15) return 14.0 - (rank * 0.35);
+    if(rank <= 60) return 8.0 - (rank * 0.08);
+    return 3.0;
+  }
+  return 5.0; // K / DEF default
+}
 
   function playerSeasonStats(pid, hist){
     const arr = (hist && hist.playerWeekly && hist.playerWeekly[pid]) || [];
@@ -2810,20 +2828,30 @@ button{
   // player at position p who is on NO roster in this league, i.e. the real waiver-wire
   // replacement level.
   function computeReplacementBaselines(hist, pointsFn){
-    const fn = pointsFn || estimatedSeasonalPoints;
-    const rostered = new Set();
-    state.rosters.forEach(r=> (r.players || []).forEach(pid=> rostered.add(pid)));
-    const baselines = {};
-    ANALYSIS_POSITIONS.forEach(pos=>{ baselines[pos] = 0; });
-    Object.keys(state.players).forEach(pid=>{
-      if(rostered.has(pid)) return;
-      const p = state.players[pid];
-      if(!p || !ANALYSIS_POSITIONS.includes(p.position) || !p.team) return;
-      const fp = fn(pid, p, hist);
-      if(fp > baselines[p.position]) baselines[p.position] = fp;
-    });
-    return baselines;
-  }
+  const fn = pointsFn || estimatedSeasonalPoints;
+  const rostered = new Set();
+  state.rosters.forEach(r=> (r.players || []).forEach(pid=> rostered.add(pid)));
+  const baselines = {};
+  ANALYSIS_POSITIONS.forEach(pos=>{ baselines[pos] = 0; });
+  
+  let maxFlexWaiver = 0;
+  
+  Object.keys(state.players).forEach(pid=>{
+    if(rostered.has(pid)) return;
+    const p = state.players[pid];
+    if(!p || !ANALYSIS_POSITIONS.includes(p.position) || !p.team) return;
+    const fp = fn(pid, p, hist);
+    if(fp > baselines[p.position]) baselines[p.position] = fp;
+    
+    // Dynamic FLEX replacement baseline (RB / WR / TE)
+    if(['RB','WR','TE'].includes(p.position) && fp > maxFlexWaiver){
+      maxFlexWaiver = fp;
+    }
+  });
+  
+  baselines['FLEX'] = maxFlexWaiver;
+  return baselines;
+}
 
   // Formula 2.1: v_p = sigma_p/sigma_RB, computed from real pooled weekly points this
   // season. Prevents a Kicker or Defense running a couple points above replacement from
@@ -2864,14 +2892,16 @@ button{
 
   // Formula 2.3: VORP_eff = (V_i - B_p) * A_i * v_p.
   function vorpFor(x, hist, baselines, posWeights, pointsFn){
-    const pos = x.player.position;
-    if(!ANALYSIS_POSITIONS.includes(pos)) return 0;
-    const fn = pointsFn || estimatedSeasonalPoints;
-    const fp = fn(x.playerId, x.player, hist);
-    const raw = fp - (baselines[pos] || 0);
-    const vWeight = (posWeights && posWeights[pos] !== undefined) ? posWeights[pos] : 1;
-    return raw * availabilityIndex(x.player) * vWeight;
-  }
+  const pos = x.player.position;
+  if(!ANALYSIS_POSITIONS.includes(pos)) return 0;
+  const fn = pointsFn || estimatedSeasonalPoints;
+  const fp = fn(x.playerId, x.player, hist);
+  const raw = fp - (baselines[pos] || 0);
+  const vWeight = (posWeights && posWeights[pos] !== undefined) ? posWeights[pos] : 1;
+  
+  // Smooth logistic decay A_i (Doubtful = 0.94, not 0.00)
+  return raw * availabilityIndex(x.player) * vWeight; 
+}
 
   // Formula 3.1: S_roster — rank each team's players within their real position (starters
   // + bench together), apply alpha^(k-1) so RB1 counts fully and RB5 tapers off.
@@ -3142,15 +3172,21 @@ button{
 
     // ---------- Whole-roster VORP score (depth-decayed, season-long) ----------
     teams.forEach(t=>{
-      const r = rosterVorpScore(t, hist, baselines, posWeights, estimatedSeasonalPoints);
-      t.rosterScore = r.total;
-      t.posVorp = r.posBreakdown;
-      const inj = injuryImpactForTeam(t, hist, baselines, posWeights);
-      t.injuryImpact = inj.impact;
-      t.injuryAffected = inj.affected;
-    });
-    const { avg: rosterAvg, std: rosterStd } = zScoreAll(teams.map(t=> t.rosterScore));
+  const r = rosterVorpScore(t, hist, baselines, posWeights, estimatedSeasonalPoints);
+  t.rosterScore = r.total;
+  t.posVorp = r.posBreakdown;
+  const inj = injuryImpactForTeam(t, hist, baselines, posWeights);
+  t.injuryImpact = inj.impact;
+  t.injuryAffected = inj.affected;
+});
 
+// Standardize across all roster totals in the league
+const { avg: rosterAvg, std: rosterStd } = zScoreAll(teams.map(t=> t.rosterScore));
+
+teams.forEach(t=>{
+  t.rosterZ = (t.rosterScore - rosterAvg) / rosterStd;
+  t.rosterGrade = gradeFromZ(t.rosterZ);
+});
     // ---------- Weekly Start/Sit grade (this week's actual starters, matchup-adjusted) ----------
     // This is the "LU" badge: hard availability cutoff + Vegas odds multiplier + floor/ceiling
     // by record, fully decoupled from the season-long roster grade above (spec: a 1-week

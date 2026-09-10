@@ -2824,32 +2824,43 @@ button{
     return credibility * ewma + (1 - credibility) * prior;
   }
 
-  // Baseline_p = points (by whichever pointsFn is passed — season or form) of the best
-  // player at position p who is on NO roster in this league, i.e. the real waiver-wire
-  // replacement level.
-  function computeReplacementBaselines(hist, pointsFn){
+  // 1. Realistic Waiver Replacement Baselines (PPG)
+const STATICAL_WAIVER_BASELINES = {
+  QB: 12.0,
+  RB: 7.5,
+  WR: 7.0,
+  TE: 4.5,
+  K: 6.0,
+  DEF: 5.0,
+  FLEX: 7.0
+};
+
+// 2. Fixed Replacement Baseline Calculation
+function computeReplacementBaselines(hist, pointsFn){
   const fn = pointsFn || estimatedSeasonalPoints;
   const rostered = new Set();
-  state.rosters.forEach(r=> (r.players || []).forEach(pid=> rostered.add(pid)));
-  const baselines = {};
-  ANALYSIS_POSITIONS.forEach(pos=>{ baselines[pos] = 0; });
   
-  let maxFlexWaiver = 0;
+  // Build set of all rostered player IDs
+  (state.rosters || []).forEach(r => (r.players || []).forEach(pid => rostered.add(pid)));
   
-  Object.keys(state.players).forEach(pid=>{
-    if(rostered.has(pid)) return;
+  const baselines = { ...STATICAL_WAIVER_BASELINES };
+
+  Object.keys(state.players || {}).forEach(pid => {
+    if (rostered.has(pid)) return; // Skip players already on fantasy rosters!
+    
     const p = state.players[pid];
     if(!p || !ANALYSIS_POSITIONS.includes(p.position) || !p.team) return;
+
     const fp = fn(pid, p, hist);
-    if(fp > baselines[p.position]) baselines[p.position] = fp;
     
-    // Dynamic FLEX replacement baseline (RB / WR / TE)
-    if(['RB','WR','TE'].includes(p.position) && fp > maxFlexWaiver){
-      maxFlexWaiver = fp;
+    // Cap replacement baseline to realistic waiver ranges (prevents free agent outliers)
+    const cap = STATICAL_WAIVER_BASELINES[p.position] + 3.5;
+    if(fp > baselines[p.position] && fp <= cap){
+      baselines[p.position] = fp;
     }
   });
-  
-  baselines['FLEX'] = maxFlexWaiver;
+
+  baselines['FLEX'] = Math.max(baselines['RB'], baselines['WR'], baselines['TE']);
   return baselines;
 }
 
@@ -2890,19 +2901,36 @@ button{
     return weights;
   }
 
-  // Formula 2.3: VORP_eff = (V_i - B_p) * A_i * v_p.
-  function vorpFor(x, hist, baselines, posWeights, pointsFn){
+ // 3. Fixed VORP Calculation (Floors negative bench impact)
+function vorpFor(x, hist, baselines, posWeights, pointsFn){
   const pos = x.player.position;
   if(!ANALYSIS_POSITIONS.includes(pos)) return 0;
+  
   const fn = pointsFn || estimatedSeasonalPoints;
   const fp = fn(x.playerId, x.player, hist);
-  const raw = fp - (baselines[pos] || 0);
+  const baseline = (baselines && baselines[pos]) ? baselines[pos] : (STATICAL_WAIVER_BASELINES[pos] || 5.0);
+  
+  const raw = fp - baseline;
   const vWeight = (posWeights && posWeights[pos] !== undefined) ? posWeights[pos] : 1;
   
-  // Smooth logistic decay A_i (Doubtful = 0.94, not 0.00)
-  return raw * availabilityIndex(x.player) * vWeight; 
+  // Floor raw VORP at -1.0 so deeper bench assets don't destroy total team score
+  const boundedVorp = Math.max(-1.0, raw);
+  return boundedVorp * availabilityIndex(x.player) * vWeight;
 }
-
+// 4. Adjusted Z-Score Grade Scale (Centers Average Team at B / B+)
+const GRADE_SCALE = [
+  { min: 1.20, label:'A+' }, 
+  { min: 0.80, label:'A' }, 
+  { min: 0.40, label:'A-' },
+  { min: 0.10, label:'B+' }, 
+  { min:-0.20, label:'B' }, 
+  { min:-0.50, label:'B-' },
+  { min:-0.80, label:'C+' }, 
+  { min:-1.10, label:'C' }, 
+  { min:-1.40, label:'C-' },
+  { min:-1.70, label:'D' }, 
+  { min:-Infinity, label:'F' }
+];
   // Formula 3.1: S_roster — rank each team's players within their real position (starters
   // + bench together), apply alpha^(k-1) so RB1 counts fully and RB5 tapers off.
   function rosterVorpScore(t, hist, baselines, posWeights, pointsFn){

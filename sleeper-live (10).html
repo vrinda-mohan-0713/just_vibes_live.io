@@ -2757,14 +2757,19 @@ button{
     return availabilityIndex(p);
   }
 
-  // Fallback "points-scale" estimate from Sleeper's consensus search_rank, used as the
-  // Bayesian/EWMA prior (FP_prior) for players with little or no real data yet.
-  function rankFallbackPoints(p){
-    if(!p) return 0;
-    const rank = p.search_rank;
-    if(!rank || rank <= 0 || rank > 9000) return 0.5;
-    return 600 / (rank + 20);
+  // Emergency fallback only.
+// This is NOT the primary valuation source anymore.
+// Real Sleeper projections are preferred whenever available.
+function rankFallbackPoints(p){
+  if(!p) return 0.5;
+
+  const rank = Number(p.search_rank);
+  if(!Number.isFinite(rank) || rank <= 0 || rank > 9000){
+    return 0.5;
   }
+
+  return 600 / (rank + 20);
+}
 
   function playerSeasonStats(pid, hist){
     const arr = (hist && hist.playerWeekly && hist.playerWeekly[pid]) || [];
@@ -2777,13 +2782,44 @@ button{
   // Formula 1.1: FP_Bayes = (n/(n+M))*mean + (M/(n+M))*prior. Keeps a single flukey
   // week-1 game from swinging a player's VORP as hard as it otherwise would — by week
   // ~M+ the raw sample dominates.
-  function estimatedSeasonalPoints(pid, p, hist){
-    const stats = playerSeasonStats(pid, hist);
-    const prior = rankFallbackPoints(p);
-    if(!stats || stats.games < 1) return prior;
-    const w = stats.games / (stats.games + VORP_SHRINKAGE_M);
-    return w * stats.mu + (1 - w) * prior;
+  // Formula 1.1: Bayesian blend of realized production and a
+// forward-looking Sleeper projection prior.
+//
+// Priority:
+//   1. Actual season-to-date production when available
+//   2. Sleeper projection as the prior
+//   3. search_rank-derived estimate only if no projection exists
+//
+// IMPORTANT:
+// The returned value remains on the same per-game fantasy-point
+// scale used by the existing VORP engine.
+
+function estimatedSeasonalPoints(pid, p, hist, projectionMap){
+  const stats = playerSeasonStats(pid, hist);
+
+  const projected =
+    projectionMap &&
+    typeof projectionMap[pid] === 'number' &&
+    Number.isFinite(projectionMap[pid])
+      ? projectionMap[pid]
+      : null;
+
+  const prior =
+    projected !== null
+      ? projected
+      : rankFallbackPoints(p);
+
+  // No real production yet:
+  // use the forward-looking projection directly.
+  if(!stats || stats.games < 1){
+    return prior;
   }
+
+  // Existing Bayesian credibility weighting is preserved.
+  const w = stats.games / (stats.games + VORP_SHRINKAGE_M);
+
+  return w * stats.mu + (1 - w) * prior;
+}
 
   // Formula 5.1: EWMA "form" value — same shrinkage-toward-prior treatment as FP_Bayes,
   // but weighting recent weeks more heavily (lambda=0.80) instead of a flat season average.
@@ -3131,26 +3167,55 @@ button{
     return hist;
   }
 
-  async function computeLeagueAnalysis(){
-    const teams = buildTeamAnalysisData();
-    if(!teams.length) return null;
+ async function computeLeagueAnalysis(){
+  const teams = buildTeamAnalysisData();
+  if(!teams.length) return null;
 
-    const hist = await loadSeasonHistory().catch(()=> ({ weeks: [], playerWeekly: {} }));
-    const baselines = computeReplacementBaselines(hist, estimatedSeasonalPoints);
-    const posWeights = computePositionVarianceWeights(hist);
-    const oddsCtx = await fetchWeeklyOddsContext(); // {} on any failure — every consumer treats that as neutral
+  const hist = await loadSeasonHistory().catch(
+    ()=> ({ weeks: [], playerWeekly: {} })
+  );
 
-    // ---------- Whole-roster VORP score (depth-decayed, season-long) ----------
-    teams.forEach(t=>{
-      const r = rosterVorpScore(t, hist, baselines, posWeights, estimatedSeasonalPoints);
-      t.rosterScore = r.total;
-      t.posVorp = r.posBreakdown;
-      const inj = injuryImpactForTeam(t, hist, baselines, posWeights);
-      t.injuryImpact = inj.impact;
-      t.injuryAffected = inj.affected;
-    });
-    const { avg: rosterAvg, std: rosterStd } = zScoreAll(teams.map(t=> t.rosterScore));
+  // PASS 1:
+  // Load Sleeper projections once and use them as the Bayesian prior.
+  const projectionMap = await loadSeasonProjections();
 
+  const pointsFn = (pid, p, history)=>{
+    return estimatedSeasonalPoints(
+      pid,
+      p,
+      history,
+      projectionMap
+    );
+  };
+
+  const baselines = computeReplacementBaselines(
+    hist,
+    pointsFn
+  );
+   
+ // ---------- Whole-roster VORP score (depth-decayed, season-long) ----------
+teams.forEach(t=>{
+  const r = rosterVorpScore(
+    t,
+    hist,
+    baselines,
+    posWeights,
+    pointsFn
+  );
+
+  t.rosterScore = r.total;
+  t.posVorp = r.posBreakdown;
+
+  const inj = injuryImpactForTeam(
+    t,
+    hist,
+    baselines,
+    posWeights
+  );
+
+  t.injuryImpact = inj.impact;
+  t.injuryAffected = inj.affected;
+});
     // ---------- Weekly Start/Sit grade (this week's actual starters, matchup-adjusted) ----------
     // This is the "LU" badge: hard availability cutoff + Vegas odds multiplier + floor/ceiling
     // by record, fully decoupled from the season-long roster grade above (spec: a 1-week
@@ -3330,7 +3395,81 @@ button{
     if(rec >= 0.5) return 'pts_half_ppr';
     return 'pts_std';
   }
+// ============================================================
+// PASS 1: Sleeper projection prior
+// ============================================================
+// Uses Sleeper's own fantasy-point projection as the prior for
+// players with little/no season history.
+//
+// The projection endpoint is the same Sleeper source already used
+// elsewhere in this dashboard for performance-vs-projection.
+//
+// Returns:
+//   { playerId: projectedFantasyPoints, ... }
+//
+// If the projection feed fails, callers fall back to rankFallbackPoints().
+// ============================================================
 
+async function loadSeasonProjections(){
+  try{
+    const url =
+      `https://api.sleeper.app/projections/nfl/regular/${state.season}/${state.week}` +
+      `?season_type=regular` +
+      `&position[]=QB` +
+      `&position[]=RB` +
+      `&position[]=WR` +
+      `&position[]=TE` +
+      `&position[]=K` +
+      `&position[]=DEF`;
+
+    const raw = await fetchJSON(url, true);
+
+    const list = Array.isArray(raw)
+      ? raw
+      : (raw && typeof raw === 'object'
+          ? Object.values(raw)
+          : null);
+
+    if(!list || !list.length){
+      throw new Error('No Sleeper projections returned');
+    }
+
+    const field = scoringFormat();
+    const projectionMap = {};
+
+    list.forEach(row=>{
+      const pid = row.player_id || (row.player && row.player.player_id);
+      const stats = row.stats || {};
+      const value = stats[field];
+
+      if(
+        pid &&
+        typeof value === 'number' &&
+        Number.isFinite(value)
+      ){
+        projectionMap[pid] = value;
+      }
+    });
+
+    if(!Object.keys(projectionMap).length){
+      throw new Error(`No usable ${field} projection fields returned`);
+    }
+
+    console.log(
+      `[PASS 1] Loaded ${Object.keys(projectionMap).length} Sleeper projections using ${field}`
+    );
+
+    return projectionMap;
+
+  }catch(err){
+    console.warn(
+      '[PASS 1] Sleeper projection load failed; using rank fallback:',
+      err
+    );
+
+    return {};
+  }
+}
   // xFP proxy: Sleeper's own weekly projection stands in for the volume-based expected-points
   // model (Carries·Expected_YPC + Targets·Expected_YPT + RedZone·TD_Rate) since per-touch
   // splits aren't exposed by the public API — proj is still a volume/role-driven expectation,
